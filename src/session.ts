@@ -365,11 +365,13 @@ export class Session {
     await new Promise<void>((resolve) => {
       let resolved = false;
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      let patternCheckInterval: ReturnType<typeof setInterval> | null = null;
 
       const done = () => {
         if (!resolved) {
           resolved = true;
           if (idleTimer) clearTimeout(idleTimer);
+          if (patternCheckInterval) clearInterval(patternCheckInterval);
           clearTimeout(deadlineTimer);
           resolve();
         }
@@ -409,6 +411,11 @@ export class Session {
 
       this.changeListeners.push(check);
       check(); // check immediately in case already changed
+
+      // In pattern mode, also check periodically since pattern may appear when PTY goes idle
+      if (text) {
+        patternCheckInterval = setInterval(check, 100);
+      }
     });
 
     return this.snapshot(options);
