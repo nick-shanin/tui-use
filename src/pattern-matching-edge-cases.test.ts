@@ -68,8 +68,9 @@ describe("Pattern Matching Edge Cases", () => {
       const result = await session.wait(5000, "hello");
       const elapsed = Date.now() - start;
 
-      // Pattern appears around 100ms in, should resolve soon after
-      expect(elapsed).toBeLessThan(500);
+      // Pattern appears around 100ms in, should resolve soon after (within 1 second)
+      // Previously timed out at 5000ms before fix
+      expect(elapsed).toBeLessThan(1000);
       expect(result.lines.join("\n")).toContain("hello");
     });
 

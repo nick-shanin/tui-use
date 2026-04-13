@@ -412,7 +412,10 @@ export class Session {
       this.changeListeners.push(check);
       check(); // check immediately in case already changed
 
-      // In pattern mode, also check periodically since pattern may appear when PTY goes idle
+      // In pattern mode, also check periodically (every 100ms) since PTY events may not fire
+      // after output appears if the process goes idle. This ensures patterns are detected
+      // even if the PTY becomes silent immediately after output, avoiding timeout.
+      // (Not needed in change mode, which uses debounce to handle PTY silence)
       if (text) {
         patternCheckInterval = setInterval(check, 100);
       }
