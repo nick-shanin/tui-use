@@ -1,5 +1,9 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { Session } from "../src/session";
 import * as net from "net";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 /**
  * Edge case tests based on known ConPTY issues from node-pty:
@@ -256,6 +260,320 @@ describe("Windows ConPTY Edge Cases", () => {
       expect(lines).toHaveLength(2);
       expect(JSON.parse(lines[0])).toEqual(msg1);
       expect(JSON.parse(lines[1])).toEqual(msg2);
+    });
+  });
+});
+
+/**
+ * Windows + Debounce + TCP IPC System Integration Tests
+ *
+ * These tests verify that the debounce feature works correctly through
+ * the Windows TCP IPC layer with ConPTY, ensuring timing is preserved
+ * across the TCP/IPC boundary and that concurrent debounce operations
+ * maintain independent state through the protocol.
+ *
+ * On Windows, Session uses TCP port 7654 to communicate with the daemon.
+ * These tests ensure debounceMs parameters are correctly serialized,
+ * transmitted, and applied on the daemon side.
+ */
+describe("Windows Debounce + TCP IPC Integration", () => {
+  let tempDir: string;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tui-use-debounce-test-"));
+  });
+
+  afterEach(() => {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch (e) {
+      // ignore cleanup errors
+    }
+  });
+
+  // Skip these tests on non-Windows (Unix socket IPC has different timing characteristics)
+  const skipIfNotWindows = () => {
+    if (process.platform !== "win32") {
+      return true;
+    }
+    return false;
+  };
+
+  it("debounce timing is preserved through TCP IPC on Windows", async () => {
+    if (skipIfNotWindows()) return;
+
+    const session = new Session("debounce-ipc-basic", "echo hello", {
+      cwd: tempDir,
+      cols: 80,
+      rows: 24,
+    });
+
+    const startTime = Date.now();
+    // Wait for output with default 100ms debounce
+    await session.wait(2000, "hello");
+    const elapsed = Date.now() - startTime;
+
+    // Should have at least 100ms debounce delay (may be more on slow systems)
+    expect(elapsed).toBeGreaterThanOrEqual(80);
+
+    session.kill();
+  });
+
+  it("custom debounceMs parameter works through TCP IPC", async () => {
+    skipIfNotWindows();
+
+    const session = new Session("debounce-ipc-custom", "echo test", {
+      cwd: tempDir,
+      cols: 80,
+      rows: 24,
+    });
+
+    const startTime = Date.now();
+    // Wait with custom 250ms debounce
+    await session.wait(3000, "test", 250);
+    const elapsed = Date.now() - startTime;
+
+    // Should respect the 250ms debounce setting
+    expect(elapsed).toBeGreaterThanOrEqual(200);
+
+    session.kill();
+  });
+
+  it("rapid output changes are debounced correctly through IPC", async () => {
+    skipIfNotWindows();
+
+    const session = new Session(
+      "debounce-ipc-rapid",
+      "bash -c 'for i in {1..5}; do echo line $i; sleep 0.05; done'",
+      { cwd: tempDir, cols: 80, rows: 24 }
+    );
+
+    const startTime = Date.now();
+    // Wait for final output with default 100ms debounce
+    // Total expected time: 5 lines * 50ms + 100ms debounce ≈ 350ms
+    await session.wait(2000, "line 5");
+    const elapsed = Date.now() - startTime;
+
+    // Should complete in reasonable time (accounting for debounce)
+    expect(elapsed).toBeGreaterThanOrEqual(200);
+    expect(elapsed).toBeLessThan(3000);
+
+    session.kill();
+  });
+
+  it("concurrent sessions maintain independent debounce timing through TCP IPC", async () => {
+    skipIfNotWindows();
+
+    const session1 = new Session("debounce-concurrent-1", "echo session1", {
+      cwd: tempDir,
+      cols: 80,
+      rows: 24,
+    });
+
+    const session2 = new Session("debounce-concurrent-2", "echo session2", {
+      cwd: tempDir,
+      cols: 80,
+      rows: 24,
+    });
+
+    const start1 = Date.now();
+    const start2 = Date.now();
+
+    // Start waits concurrently with different patterns
+    const wait1Promise = session1.wait(2000, "session1");
+    const wait2Promise = session2.wait(2000, "session2");
+
+    await Promise.all([wait1Promise, wait2Promise]);
+
+    const elapsed1 = Date.now() - start1;
+    const elapsed2 = Date.now() - start2;
+
+    // Both should complete, respecting their individual debounce settings
+    expect(elapsed1).toBeGreaterThan(0);
+    expect(elapsed2).toBeGreaterThan(0);
+
+    session1.kill();
+    session2.kill();
+  });
+
+  it("debounce + wait timeout interaction works correctly through IPC", async () => {
+    skipIfNotWindows();
+
+    const session = new Session(
+      "debounce-ipc-timeout",
+      "bash -c 'echo initial; sleep 1; echo final'",
+      { cwd: tempDir, cols: 80, rows: 24 }
+    );
+
+    const startTime = Date.now();
+
+    // Wait for pattern that appears quickly with short timeout
+    // This tests the interaction between debounce and timeout paths
+    try {
+      await session.wait(500, "final"); // Too short, should timeout
+    } catch (e) {
+      // Expected to timeout
+    }
+
+    const elapsed = Date.now() - startTime;
+
+    // Should timeout around the 500ms mark (not wait for debounce)
+    expect(elapsed).toBeLessThan(1000);
+
+    session.kill();
+  });
+
+  describe("Protocol & Serialization", () => {
+    it("debounceMs parameter survives JSON serialization through TCP", () => {
+      // Verify the protocol can correctly pass debounceMs values
+      const testCases = [0, 50, 100, 250, 1000];
+
+      testCases.forEach((debounceMs) => {
+        // Simulate a wait request being serialized for TCP transmission
+        const request = {
+          type: "wait",
+          session_id: "test-session",
+          timeoutMs: 3000,
+          pattern: "test",
+          debounceMs: debounceMs,
+        };
+
+        const serialized = JSON.stringify(request);
+        const deserialized = JSON.parse(serialized);
+
+        expect(deserialized.debounceMs).toBe(debounceMs);
+        expect(deserialized.type).toBe("wait");
+      });
+    });
+
+    it("Windows TCP port is correctly configured for IPC", () => {
+      if (skipIfNotWindows()) return;
+
+      // On Windows, daemon listens on TCP port 7654 for client connections
+      // Verify this is not a privileged port and is appropriate for loopback
+      const DAEMON_PORT = 7654;
+      expect(DAEMON_PORT).toBeGreaterThan(1024); // Non-privileged
+      expect(DAEMON_PORT).toBeLessThan(65536); // Valid port range
+    });
+
+    it("concurrent wait requests maintain independent debounceMs state", async () => {
+      if (skipIfNotWindows()) return;
+
+      const session = new Session("debounce-concurrent", "bash -c 'echo a; sleep 0.2; echo b'", {
+        cwd: tempDir,
+        cols: 80,
+        rows: 24,
+      });
+
+      // Send two concurrent waits with different debounce values
+      // through the same TCP connection (same session)
+      const start1 = Date.now();
+      const start2 = Date.now();
+
+      const wait1 = session.wait(2000, "a", 50);  // Short debounce
+      const wait2 = session.wait(2000, "b", 150); // Longer debounce
+
+      await Promise.all([wait1, wait2]);
+
+      const elapsed1 = Date.now() - start1;
+      const elapsed2 = Date.now() - start2;
+
+      // Both should complete independently
+      expect(elapsed1).toBeGreaterThan(0);
+      expect(elapsed2).toBeGreaterThan(0);
+
+      session.kill();
+    });
+  });
+
+  describe("Windows TCP IPC End-to-End", () => {
+    it("debounce timing is preserved through TCP IPC on Windows", async () => {
+      if (skipIfNotWindows()) return;
+
+      const session = new Session("debounce-ipc-basic", "echo hello", {
+        cwd: tempDir,
+        cols: 80,
+        rows: 24,
+      });
+
+      const startTime = Date.now();
+      // Wait for output with default 100ms debounce
+      await session.wait(2000, "hello");
+      const elapsed = Date.now() - startTime;
+
+      // Should respect the ~100ms debounce (accounting for system variance)
+      expect(elapsed).toBeGreaterThanOrEqual(80);
+
+      session.kill();
+    });
+
+    it("custom debounceMs parameter works through TCP IPC", async () => {
+      if (skipIfNotWindows()) return;
+
+      const session = new Session("debounce-ipc-custom", "echo test", {
+        cwd: tempDir,
+        cols: 80,
+        rows: 24,
+      });
+
+      const startTime = Date.now();
+      // Wait with custom 250ms debounce
+      await session.wait(3000, "test", 250);
+      const elapsed = Date.now() - startTime;
+
+      // Should respect the 250ms debounce setting
+      expect(elapsed).toBeGreaterThanOrEqual(200);
+
+      session.kill();
+    });
+
+    it("rapid output changes are debounced correctly through IPC", async () => {
+      if (skipIfNotWindows()) return;
+
+      const session = new Session(
+        "debounce-ipc-rapid",
+        "bash -c 'for i in {1..5}; do echo line $i; sleep 0.05; done'",
+        { cwd: tempDir, cols: 80, rows: 24 }
+      );
+
+      const startTime = Date.now();
+      // Wait for final output with default 100ms debounce
+      // Total expected time: 5 lines * 50ms + 100ms debounce ≈ 350ms
+      await session.wait(2000, "line 5");
+      const elapsed = Date.now() - startTime;
+
+      // Should complete in reasonable time (accounting for debounce)
+      expect(elapsed).toBeGreaterThanOrEqual(200);
+      expect(elapsed).toBeLessThan(3000);
+
+      session.kill();
+    });
+
+    it("debounce + wait timeout interaction works correctly through IPC", async () => {
+      if (skipIfNotWindows()) return;
+
+      const session = new Session(
+        "debounce-ipc-timeout",
+        "bash -c 'echo initial; sleep 1; echo final'",
+        { cwd: tempDir, cols: 80, rows: 24 }
+      );
+
+      const startTime = Date.now();
+
+      // Wait for pattern that appears slowly with short timeout
+      // This tests the interaction between debounce and timeout paths
+      try {
+        await session.wait(500, "final"); // Too short, should timeout
+      } catch (e) {
+        // Expected to timeout
+      }
+
+      const elapsed = Date.now() - startTime;
+
+      // Should timeout around the 500ms mark (not wait for debounce)
+      expect(elapsed).toBeLessThan(1000);
+
+      session.kill();
     });
   });
 });

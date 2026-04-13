@@ -82,8 +82,8 @@ describe("Session", () => {
 
   describe("find", () => {
     it("finds text matching a pattern", async () => {
-      // Wait a bit for the session to start
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Wait for "hello" to appear in the viewport
+      await session.wait(1000, "hello");
 
       const matches = session.find("hello");
       expect(matches.length).toBeGreaterThan(0);
@@ -91,14 +91,16 @@ describe("Session", () => {
     });
 
     it("returns empty array when no match", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Wait for "hello" to appear, then search for something else
+      await session.wait(1000, "hello");
 
       const matches = session.find("xyz123");
       expect(matches).toHaveLength(0);
     });
 
     it("supports regex patterns", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Wait for "hello" to appear in the viewport
+      await session.wait(1000, "hello");
 
       const matches = session.find("h.llo");
       expect(matches.length).toBeGreaterThan(0);
